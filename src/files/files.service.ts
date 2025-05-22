@@ -261,59 +261,9 @@ export class FilesService {
       } // Create a safe filename
       const safeFilename = file.name.replace(/[^a-zA-Z0-9_\-.]/g, '_');
       const totalFileSize = file.size;
-
-      // Handle range requests (for media streaming)
-      let start = 0;
-      let end = totalFileSize - 1;
-      let contentLength = totalFileSize;
-      let statusCode = 200;
-      const rangeHeader = res.req.headers.range;
-      const isRangeRequest = !!rangeHeader; // Check if this is a range request (common for video/audio streaming)
-      if (isRangeRequest) {
-        try {
-          const parts = rangeHeader.replace(/bytes=/, '').split('-');
-          start = parseInt(parts[0], 10);
-
-          // If end is specified in the range
-          if (parts[1] && parts[1].trim() !== '') {
-            end = parseInt(parts[1], 10);
-          }
-
-          // Handle invalid ranges
-          if (isNaN(start)) {
-            start = 0;
-          }
-
-          if (isNaN(end) || end >= totalFileSize) {
-            end = totalFileSize - 1;
-          }
-
-          // Validate range values
-          if (start >= totalFileSize || start < 0 || end < start) {
-            // Invalid range - respond with a 416 Range Not Satisfiable
-            res.status(416);
-            res.setHeader('Content-Range', `bytes */${totalFileSize}`);
-            res.send('Range Not Satisfiable');
-            return;
-          }
-
-          // Calculate new content length
-          contentLength = end - start + 1;
-
-          // Use partial content status for range requests
-          statusCode = 206;
-          console.log(
-            `[FileStream] Range request: ${start}-${end}/${totalFileSize}`,
-          );
-        } catch (error) {
-          console.error('[FileStream] Error parsing range header:', error);
-          // Fall back to serving the entire file
-          start = 0;
-          end = totalFileSize - 1;
-          contentLength = totalFileSize;
-          statusCode = 200;
-        }
-      } // Determine if it's a media file that typically benefits from streaming
+      const contentLength = totalFileSize;
+      const statusCode = 200;
+      // Determine if it's a media file that typically benefits from streaming
       const isStreamableMedia =
         file.type &&
         (file.type.startsWith('image/') ||
@@ -322,7 +272,8 @@ export class FilesService {
           file.type === 'application/pdf');
 
       // Set response status and headers based on request type
-      res.status(statusCode); // Set comprehensive response headers
+      res.status(statusCode);
+      // Set comprehensive response headers
       res.setHeader('Content-Type', file.type || 'application/octet-stream');
 
       // For streamable media without download intention, use inline disposition
@@ -344,17 +295,9 @@ export class FilesService {
         );
       }
 
-      // Set content length based on full file or range
+      // Set content length
       res.setHeader('Content-Length', contentLength.toString());
-
-      // Add range-specific headers if needed
-      if (isRangeRequest) {
-        res.setHeader(
-          'Content-Range',
-          `bytes ${start}-${end}/${totalFileSize}`,
-        );
-        res.setHeader('Accept-Ranges', 'bytes');
-      } // Add caching and other headers
+      // Add caching and other headers
       res.setHeader(
         'Cache-Control',
         'no-store, no-cache, must-revalidate, private',
@@ -370,7 +313,9 @@ export class FilesService {
       // Add cross-origin isolation headers for better compatibility with modern browsers
       // and to enable certain browser features like SharedArrayBuffer for video processing
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-      res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp'); // Initialize tracking variables      // Enhanced variables for tracking stream state
+      res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+      // Initialize tracking variables
+      // Enhanced variables for tracking stream state
       let currentChunkIndex = 0;
       let streamingComplete = false;
       const chunkBuffers: Map<number, Buffer> = new Map();
@@ -379,14 +324,11 @@ export class FilesService {
       const MAX_RETRIES = 3; // Maximum retry attempts per chunk
       let hasError = false;
       const LOOK_AHEAD = 2; // Always download 2 chunks ahead
-      // Variables for range requests
-      let bytesServed = 0;
-      const targetByteCount = end - start + 1;
 
       // For each chunk, determine its size (use the content length if available, or estimate)
       const chunkSizes = sortedChunks.map((chunk) => {
         // Use a default/estimated size if the chunk doesn't have a size property
-        return chunk['size'] || 65536; // Default to 64KB if size not available
+        return chunk['size'] || 9 * 1024 * 1024; // Default to 9MB chunk size
       });
       const chunkOffsets: number[] = [];
 
@@ -396,27 +338,7 @@ export class FilesService {
         chunkOffsets.push(runningOffset);
         runningOffset += size;
       }
-
-      // Find starting chunk for range requests
-      if (isRangeRequest) {
-        for (let i = 0; i < sortedChunks.length; i++) {
-          const chunkEnd = chunkOffsets[i] + chunkSizes[i] - 1;
-          if (chunkOffsets[i] <= start && start <= chunkEnd) {
-            currentChunkIndex = i;
-            console.log(
-              `[FileStream] Range request starting at chunk ${currentChunkIndex} (offset ${chunkOffsets[i]} bytes)`,
-            );
-            break;
-          }
-        }
-      } // Calculate chunk information for range requests
-      // Find starting chunk based on byte range
-      if (isRangeRequest) {
-        // We've already identified the starting chunk above
-        console.log(
-          `[FileStream] Range request will stream from chunk ${currentChunkIndex}`,
-        );
-      } // Create an improved function to download a specific chunk
+      // Create an improved function to download a specific chunk
       const downloadChunk = async (chunkIndex: number): Promise<void> => {
         // Skip if chunk is already processed or an error occurred
         if (
@@ -560,7 +482,8 @@ export class FilesService {
             streamingComplete = true;
           }
         }
-      }; // Main function that handles both streaming and scheduling downloads
+      };
+      // Main function that handles both streaming and scheduling downloads
       const processNextChunks = (): void => {
         if (streamingComplete || hasError) {
           return;
@@ -573,54 +496,12 @@ export class FilesService {
 
           if (buffer) {
             try {
-              // Handle partial chunk streaming for range requests
-              if (isRangeRequest) {
-                const chunkStart = chunkOffsets[currentChunkIndex];
-                const chunkEnd = chunkStart + chunkSizes[currentChunkIndex] - 1;
-
-                // Determine which part of this chunk to stream
-                let writeStart = 0;
-                let writeEnd = buffer.length - 1;
-
-                // If this is the first chunk in the range
-                if (start > chunkStart) {
-                  writeStart = start - chunkStart;
-                }
-
-                // If this is the last chunk in the range
-                if (end < chunkEnd) {
-                  writeEnd = end - chunkStart;
-                }
-
-                // Create slice of the buffer to write
-                const sliceToWrite = buffer.slice(writeStart, writeEnd + 1);
-                bytesServed += sliceToWrite.length;
-
-                // Write the slice to the response
-                res.write(sliceToWrite);
-                chunksStreamed = true;
-
-                console.log(
-                  `[FileStream] Streamed partial chunk ${currentChunkIndex + 1}/${sortedChunks.length}, bytes ${writeStart}-${writeEnd}/${buffer.length}`,
-                );
-
-                // If we've served all the bytes in the requested range, we're done
-                if (bytesServed >= targetByteCount) {
-                  console.log(
-                    `[FileStream] Completed range request, served ${bytesServed} bytes`,
-                  );
-                  res.end();
-                  streamingComplete = true;
-                  return;
-                }
-              } else {
-                // For non-range requests, stream the entire chunk
-                res.write(buffer);
-                chunksStreamed = true;
-                console.log(
-                  `[FileStream] Streamed chunk ${currentChunkIndex + 1}/${sortedChunks.length} to client`,
-                );
-              }
+              // Stream the entire chunk
+              res.write(buffer);
+              chunksStreamed = true;
+              console.log(
+                `[FileStream] Streamed chunk ${currentChunkIndex + 1}/${sortedChunks.length} to client`,
+              );
             } catch (error) {
               console.error(
                 `[FileStream] Error streaming chunk ${currentChunkIndex}:`,
@@ -663,7 +544,8 @@ export class FilesService {
             `[FileStream] Progress: ${percentComplete}% (${downloadedCount}/${totalChunks} chunks)`,
           );
         }
-      }; // Schedule downloads for the upcoming chunks
+      };
+      // Schedule downloads for the upcoming chunks
       const scheduleDownloads = (): void => {
         if (streamingComplete || hasError) {
           return;
@@ -682,7 +564,8 @@ export class FilesService {
             void downloadChunk(i);
           }
         }
-      }; // Initialize stream: download the first few chunks
+      };
+      // Initialize stream: download the first few chunks
       const initialChunksToLoad = Math.min(LOOK_AHEAD + 1, sortedChunks.length);
       console.log(
         `[FileStream] Starting stream for file "${safeFilename}" (${sortedChunks.length} chunks)`,
@@ -750,13 +633,14 @@ export class FilesService {
               hasError = true;
             }
           }
-        } // Also check for overall stream progress
+        }
+        // Also check for overall stream progress
         const downloadedCount = currentChunkIndex;
         const pendingCount = downloadingChunks.size;
         const totalChunks = sortedChunks.length;
-        const percentComplete = isRangeRequest
-          ? Math.round((bytesServed / targetByteCount) * 100)
-          : Math.round((downloadedCount / totalChunks) * 100);
+        const percentComplete = Math.round(
+          (downloadedCount / totalChunks) * 100,
+        );
 
         console.log(
           `[FileStream] Health check: ${percentComplete}% complete, ${downloadedCount}/${totalChunks} chunks streamed, ${pendingCount} pending downloads`,
