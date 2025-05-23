@@ -258,11 +258,12 @@ export class FilesService {
               .where(eq(chunks.id, expiredChunks[i].id));
           }
         }
-      } // Create a safe filename
+      }
+
+      // Create a safe filename
       const safeFilename = file.name.replace(/[^a-zA-Z0-9_\-.]/g, '_');
       const totalFileSize = file.size;
-      const contentLength = totalFileSize;
-      const statusCode = 200;
+
       // Determine if it's a media file that typically benefits from streaming
       const isStreamableMedia =
         file.type &&
@@ -271,9 +272,8 @@ export class FilesService {
           file.type.startsWith('audio/') ||
           file.type === 'application/pdf');
 
-      // Set response status and headers based on request type
-      res.status(statusCode);
-      // Set comprehensive response headers
+      // Set response headers
+      res.status(200);
       res.setHeader('Content-Type', file.type || 'application/octet-stream');
 
       // For streamable media without download intention, use inline disposition
@@ -296,7 +296,7 @@ export class FilesService {
       }
 
       // Set content length
-      res.setHeader('Content-Length', contentLength.toString());
+      res.setHeader('Content-Length', totalFileSize.toString());
       // Add caching and other headers
       res.setHeader(
         'Cache-Control',
@@ -307,97 +307,27 @@ export class FilesService {
       res.setHeader('X-File-Size', totalFileSize.toString());
       res.setHeader('X-Chunk-Count', sortedChunks.length.toString());
 
-      // Always include Accept-Ranges header, even for non-range requests
-      res.setHeader('Accept-Ranges', 'bytes');
-
       // Add cross-origin isolation headers for better compatibility with modern browsers
-      // and to enable certain browser features like SharedArrayBuffer for video processing
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-      // Initialize tracking variables
-      // Enhanced variables for tracking stream state
-      let currentChunkIndex = 0;
-      let streamingComplete = false;
-      const chunkBuffers: Map<number, Buffer> = new Map();
-      const downloadingChunks: Set<number> = new Set();
-      const failedRetries: Map<number, number> = new Map(); // Track retry attempts per chunk
-      const MAX_RETRIES = 3; // Maximum retry attempts per chunk
-      let hasError = false;
-      const LOOK_AHEAD = 2; // Always download 2 chunks ahead
 
-      // For each chunk, determine its size (use the content length if available, or estimate)
-      const chunkSizes = sortedChunks.map((chunk) => {
-        // Use a default/estimated size if the chunk doesn't have a size property
-        return chunk['size'] || 9 * 1024 * 1024; // Default to 9MB chunk size
-      });
-      const chunkOffsets: number[] = [];
+      console.log(`[FileStream] Starting stream for file "${safeFilename}"`);
 
-      // Calculate chunk offsets (start byte position of each chunk)
-      let runningOffset = 0;
-      for (const size of chunkSizes) {
-        chunkOffsets.push(runningOffset);
-        runningOffset += size;
-      }
-      // Create an improved function to download a specific chunk
-      const downloadChunk = async (chunkIndex: number): Promise<void> => {
-        // Skip if chunk is already processed or an error occurred
-        if (
-          chunkBuffers.has(chunkIndex) ||
-          downloadingChunks.has(chunkIndex) ||
-          hasError
-        ) {
-          return;
-        }
-
-        // Check retry count for this chunk
-        const retryCount = failedRetries.get(chunkIndex) || 0;
-        if (retryCount >= MAX_RETRIES) {
-          console.error(
-            `[FileStream] Chunk ${chunkIndex} failed after ${MAX_RETRIES} attempts`,
-          );
-          hasError = true;
-
-          if (!streamingComplete) {
-            if (!res.headersSent) {
-              res.status(500).json({
-                message: 'Error streaming file',
-                error: `Failed to download chunk ${chunkIndex} after ${MAX_RETRIES} attempts`,
-                code: 'MAX_RETRIES_EXCEEDED',
-              });
-            } else {
-              res.end();
-            }
-            streamingComplete = true;
-          }
-          return;
-        }
-
-        // Mark this chunk as being downloaded
-        downloadingChunks.add(chunkIndex);
-
-        const chunk = sortedChunks[chunkIndex];
-        if (!chunk) {
-          downloadingChunks.delete(chunkIndex);
-          return;
-        }
-
-        const attemptMessage =
-          retryCount > 0 ? ` (retry ${retryCount}/${MAX_RETRIES})` : '';
+      // Stream each chunk sequentially
+      for (let i = 0; i < sortedChunks.length; i++) {
+        const chunk = sortedChunks[i];
         console.log(
-          `[FileStream] Downloading chunk ${chunkIndex + 1}/${sortedChunks.length}${attemptMessage}`,
+          `[FileStream] Processing chunk ${i + 1}/${sortedChunks.length}`,
         );
 
         try {
-          // Set up timeout to prevent hanging downloads
+          // Download the chunk
           const abortController = new AbortController();
           const timeoutId = setTimeout(() => {
-            console.warn(
-              `[FileStream] Download timeout for chunk ${chunkIndex}`,
-            );
+            console.warn(`[FileStream] Download timeout for chunk ${i}`);
             abortController.abort();
           }, 30000); // 30 second timeout
 
-          // Fetch the chunk with proper headers
           const response = await fetch(chunk.url, {
             headers: {
               'User-Agent': 'DiscordBot (fullx-app, 1.0.0)',
@@ -414,238 +344,55 @@ export class FilesService {
             );
           }
 
-          // Convert to buffer
+          // Get the response as an array buffer and convert to Node.js Buffer
           const arrayBuffer = await response.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
 
-          if (arrayBuffer.byteLength === 0) {
+          if (buffer.byteLength === 0) {
             throw new Error(
               `Received empty chunk data for chunk ${chunk.chunk_number}`,
             );
           }
 
           console.log(
-            `[FileStream] Downloaded chunk ${chunkIndex + 1}/${sortedChunks.length}, size: ${(arrayBuffer.byteLength / 1024).toFixed(2)} KB`,
+            `[FileStream] Downloaded chunk ${i + 1}/${sortedChunks.length}, size: ${(buffer.byteLength / 1024).toFixed(2)} KB`,
           );
 
-          // Store the downloaded chunk
-          chunkBuffers.set(chunkIndex, Buffer.from(arrayBuffer));
+          // Write the buffer directly to the response
+          const writeSuccess = res.write(buffer);
 
-          // Remove from downloading set and clear retry count on success
-          downloadingChunks.delete(chunkIndex);
-          failedRetries.delete(chunkIndex);
+          // If the client is slow, wait for drain event before continuing
+          if (!writeSuccess) {
+            await new Promise<void>((resolve) => {
+              res.once('drain', () => resolve());
+            });
+          }
 
-          // Process the next chunks if possible
-          processNextChunks();
+          console.log(
+            `[FileStream] Streamed chunk ${i + 1}/${sortedChunks.length} to client`,
+          );
         } catch (error) {
           console.error(
-            `[FileStream] Error downloading chunk ${chunk.chunk_number}:`,
-            error,
+            `[FileStream] Error processing chunk ${i}: ${error instanceof Error ? error.message : 'Unknown error'}`,
           );
-          downloadingChunks.delete(chunkIndex);
 
-          // Increment retry count
-          failedRetries.set(chunkIndex, retryCount + 1);
-
-          // Attempt retry with exponential backoff if we haven't exceeded max retries
-          if (retryCount < MAX_RETRIES && !streamingComplete) {
-            const backoffMs = Math.min(1000 * Math.pow(2, retryCount), 10000); // Exponential backoff with 10s max
-            console.log(
-              `[FileStream] Retrying chunk ${chunkIndex} in ${backoffMs}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`,
-            );
-            setTimeout(() => {
-              if (!streamingComplete) {
-                void downloadChunk(chunkIndex);
-              }
-            }, backoffMs);
-            return;
-          }
-
-          // Mark as error if exceeded retries
-          hasError = true;
-
-          // Handle error appropriately based on stream state
-          if (streamingComplete) {
-            return;
-          }
-
-          // Send error response if headers not sent yet
           if (!res.headersSent) {
             res.status(500).json({
               message: 'Error streaming file',
               error: error instanceof Error ? error.message : 'Unknown error',
               code: 'CHUNK_DOWNLOAD_FAILED',
             });
-            streamingComplete = true;
           } else {
-            // End the response if we've already started streaming
             res.end();
-            streamingComplete = true;
           }
-        }
-      };
-      // Main function that handles both streaming and scheduling downloads
-      const processNextChunks = (): void => {
-        if (streamingComplete || hasError) {
+
           return;
         }
-
-        // 1. Stream available chunks to client
-        let chunksStreamed = false;
-        while (chunkBuffers.has(currentChunkIndex)) {
-          const buffer = chunkBuffers.get(currentChunkIndex);
-
-          if (buffer) {
-            try {
-              // Stream the entire chunk
-              res.write(buffer);
-              chunksStreamed = true;
-              console.log(
-                `[FileStream] Streamed chunk ${currentChunkIndex + 1}/${sortedChunks.length} to client`,
-              );
-            } catch (error) {
-              console.error(
-                `[FileStream] Error streaming chunk ${currentChunkIndex}:`,
-                error,
-              );
-              streamingComplete = true;
-              res.end();
-              return;
-            }
-          }
-
-          // Free memory as soon as chunk is streamed
-          chunkBuffers.delete(currentChunkIndex);
-
-          // Move to next chunk
-          currentChunkIndex++;
-
-          // Check if we've streamed all chunks
-          if (currentChunkIndex >= sortedChunks.length) {
-            console.log('[FileStream] All chunks streamed, ending response');
-            res.end();
-            streamingComplete = true;
-            return;
-          }
-        }
-
-        // 2. Schedule downloads for look-ahead chunks
-        if (!streamingComplete) {
-          scheduleDownloads();
-        }
-
-        // 3. Log progress if chunks were streamed
-        if (chunksStreamed) {
-          const downloadedCount = currentChunkIndex;
-          const totalChunks = sortedChunks.length;
-          const percentComplete = Math.round(
-            (downloadedCount / totalChunks) * 100,
-          );
-          console.log(
-            `[FileStream] Progress: ${percentComplete}% (${downloadedCount}/${totalChunks} chunks)`,
-          );
-        }
-      };
-      // Schedule downloads for the upcoming chunks
-      const scheduleDownloads = (): void => {
-        if (streamingComplete || hasError) {
-          return;
-        }
-
-        // Calculate which chunks to download next
-        const endIndex = Math.min(
-          currentChunkIndex + LOOK_AHEAD,
-          sortedChunks.length,
-        );
-
-        // Download chunks in the look-ahead window that aren't already being processed
-        for (let i = currentChunkIndex; i < endIndex; i++) {
-          if (!chunkBuffers.has(i) && !downloadingChunks.has(i)) {
-            // Use void to explicitly ignore the promise
-            void downloadChunk(i);
-          }
-        }
-      };
-      // Initialize stream: download the first few chunks
-      const initialChunksToLoad = Math.min(LOOK_AHEAD + 1, sortedChunks.length);
-      console.log(
-        `[FileStream] Starting stream for file "${safeFilename}" (${sortedChunks.length} chunks)`,
-      );
-
-      // Download initial chunks in parallel
-      const initialDownloads: Promise<void>[] = [];
-
-      for (let i = 0; i < initialChunksToLoad; i++) {
-        initialDownloads.push(downloadChunk(i));
       }
 
-      // Wait for at least the first chunk to download before starting the stream
-      await Promise.all(initialDownloads);
-
-      // Start the streaming process
-      processNextChunks();
-      // Set up an interval to monitor stream health
-      const healthCheckInterval = setInterval(() => {
-        if (streamingComplete) {
-          clearInterval(healthCheckInterval);
-          return;
-        }
-
-        if (hasError) {
-          streamingComplete = true;
-          if (!res.headersSent) {
-            res.status(500).json({
-              message: 'Error streaming file',
-              code: 'STREAM_ERROR',
-            });
-          } else {
-            res.end();
-          }
-          clearInterval(healthCheckInterval);
-          return;
-        }
-
-        // Check for stalled downloads - if currentChunkIndex hasn't moved but we're not done
-        if (
-          !chunkBuffers.has(currentChunkIndex) &&
-          !downloadingChunks.has(currentChunkIndex) &&
-          currentChunkIndex < sortedChunks.length
-        ) {
-          const retryCount = failedRetries.get(currentChunkIndex) || 0;
-          if (retryCount < MAX_RETRIES) {
-            console.log(
-              `[FileStream] Health check detected stalled chunk ${currentChunkIndex}, restarting download`,
-            );
-            void downloadChunk(currentChunkIndex);
-          } else {
-            console.error(
-              `[FileStream] Health check detected permanently failed chunk ${currentChunkIndex}`,
-            );
-
-            // Check if we can skip this chunk in emergency cases
-            // Only do this if we've already streamed a significant portion of the file
-            if (currentChunkIndex > sortedChunks.length * 0.8) {
-              console.warn(
-                `[FileStream] Attempting to skip problematic chunk ${currentChunkIndex} as we're near the end`,
-              );
-              currentChunkIndex++;
-              processNextChunks();
-            } else {
-              hasError = true;
-            }
-          }
-        }
-        // Also check for overall stream progress
-        const downloadedCount = currentChunkIndex;
-        const pendingCount = downloadingChunks.size;
-        const totalChunks = sortedChunks.length;
-        const percentComplete = Math.round(
-          (downloadedCount / totalChunks) * 100,
-        );
-
-        console.log(
-          `[FileStream] Health check: ${percentComplete}% complete, ${downloadedCount}/${totalChunks} chunks streamed, ${pendingCount} pending downloads`,
-        );
-      }, 5000); // Check every 5 seconds
+      // Complete the response
+      res.end();
+      console.log(`[FileStream] File "${safeFilename}" successfully streamed`);
     } catch (error) {
       console.error('[FileStream] Error in streamFile:', error);
       if (!res.headersSent) {
